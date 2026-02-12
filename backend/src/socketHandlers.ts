@@ -5,6 +5,7 @@ import NoteVersion from "./models/NoteVersion";
 import Workspace from "./models/Workspace";
 import User from "./models/User";
 import { AuditService } from "./services/auditService";
+import { YjsProvider } from "./yjsProvider";
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -71,6 +72,12 @@ export default function setupSocketHandlers(io: SocketIOServer) {
       console.log(`User ${socket.userId} joined note ${noteId}`);
     });
 
+    // Y.js collaboration events
+    socket.on("join-note-yjs", (data: { noteId: string; workspaceId: string }) => {
+      // Delegate to YjsProvider
+      socket.emit("yjs-ready", { noteId: data.noteId });
+    });
+
     socket.on("leave-note", (noteId: string) => {
       socket.leave(`note-${noteId}`);
 
@@ -84,11 +91,11 @@ export default function setupSocketHandlers(io: SocketIOServer) {
       socket.to(`note-${noteId}`).emit("user-left", { userId: socket.userId });
     });
 
-    socket.on("update-note", async (data: { noteId: string; title: string; content: string }) => {
-      const { noteId, title, content } = data;
+    socket.on("update-note", async (data: { noteId: string; title: string; content: string; expectedVersion?: number }) => {
+      const { noteId, title, content, expectedVersion } = data;
 
-      // Validate note and permissions
-      const note = await Note.findOne({ _id: noteId, workspaceId: socket.workspaceId });
+      // Validate note and permissions with OCC
+      const note = await Note.findOne({ _id: noteId, workspaceId: socket.workspaceId }) as any;
       if (!note) {
         socket.emit("error", { message: "Note not found" });
         return;
@@ -102,24 +109,37 @@ export default function setupSocketHandlers(io: SocketIOServer) {
         return;
       }
 
-      // Update note (last-write-wins)
+      // OCC check
+      if (expectedVersion !== undefined && note.version !== expectedVersion) {
+        socket.emit('note-update-conflict', {
+          noteId,
+          conflict: {
+            error: 'Conflict',
+            message: 'Note has been updated by another user. Please refresh and try again.',
+            currentVersion: note.version,
+            expectedVersion,
+            serverData: {
+              title: note.title,
+              content: note.content,
+              updatedAt: note.updatedAt
+            },
+            guidance: 'Fetch the latest version, merge your changes manually, and retry the update.'
+          },
+          clientChanges: { title, content }
+        });
+        return;
+      }
+
+      // Update note with incremented version
       note.title = title;
       note.content = content;
+      note.version = note.version + 1;
       note.updatedAt = new Date();
       await note.save();
 
-      // Create version
-      const latestVersion = await NoteVersion.findOne({ noteId }).sort({ versionNumber: -1 });
-      const nextVersionNumber = latestVersion ? latestVersion.versionNumber + 1 : 1;
-      const version = new NoteVersion({
-        noteId,
-        versionNumber: nextVersionNumber,
-        contentSnapshot: { title, content },
-        author: socket.userId,
-        workspaceId: socket.workspaceId,
-        metadata: { reason: "Real-time edit" },
-      });
-      await version.save();
+      // Create version using PersistenceManager
+      const persistence = require('./persistence').PersistenceManager.getInstance();
+      await persistence.createVersion(noteId, socket.userId!, socket.workspaceId!, "Real-time edit");
 
       // Log audit
       await AuditService.logEvent(
@@ -128,7 +148,7 @@ export default function setupSocketHandlers(io: SocketIOServer) {
         socket.workspaceId!,
         noteId,
         "note",
-        { title, version: nextVersionNumber }
+        { title, version: note.version }
       );
 
       // Broadcast update to room
